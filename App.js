@@ -1,61 +1,103 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  StyleSheet, Text, View, FlatList, RefreshControl, SafeAreaView, StatusBar 
+import {
+  StyleSheet, Text, View, FlatList, RefreshControl, SafeAreaView, StatusBar, Platform
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Notifications from 'expo-notifications';
 
-// Сюди підставте посилання на ваш JSON (наприклад, з GitHub Raw або вашого сервера)
+// Вставте ваше посилання на Raw JSON з GitHub:
 const API_URL = 'https://githubusercontent.com';
 const STORAGE_KEY = '@schedule_3_1';
 
-// Тестові дані, поки ви не підключили реальний парсер
-const MOCK_DATA = {
-  updatedAt: '23.11, 08:30',
-  queue: '3.1',
-  hours: [
-    { time: '00:00 - 02:00', status: 'on' },
-    { time: '02:00 - 06:00', status: 'off' },
-    { time: '06:00 - 08:00', status: 'on' },
-    { time: '08:00 - 12:00', status: 'off' }, // Поточний слот
-    { time: '12:00 - 14:00', status: 'on' },
-    { time: '14:00 - 18:00', status: 'off' },
-    { time: '18:00 - 20:00', status: 'on' },
-    { time: '20:00 - 24:00', status: 'off' },
-  ]
-};
+// Налаштування відображення пушів, навіть коли додаток відкритий
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
 
 export default function App() {
-  const [schedule, setSchedule] = useState(MOCK_DATA);
+  const [schedule, setSchedule] = useState({ queue: '3.1', updatedAt: 'Завантаження...', hours: [] });
   const [refreshing, setRefreshing] = useState(false);
   const [isOffline, setIsOffline] = useState(false);
 
-  // Завантаження збереженого графіка при старті без інтернету
   useEffect(() => {
+    requestNotificationPermissions();
     loadCachedSchedule();
     fetchSchedule();
   }, []);
+
+  // Запит дозволу на пуші для Android 13+
+  const requestNotificationPermissions = async () => {
+    if (Platform.OS === 'android') {
+      await Notifications.setNotificationChannelAsync('outages', {
+        name: 'Графік відключень',
+        importance: Notifications.AndroidImportance.MAX,
+        vibrationPattern: [0, 250, 250, 250],
+      });
+    }
+    await Notifications.requestPermissionsAsync();
+  };
+
+  // Планування пушів за 15 хвилин до кожного відключення
+  const scheduleOutageAlerts = async (hoursList) => {
+    // Спочатку скасовуємо старі заплановані сповіщення, щоб не було дублів при зміні графіка
+    await Notifications.cancelAllScheduledNotificationsAsync();
+
+    const now = new Date();
+
+    for (const slot of hoursList) {
+      if (slot.status !== 'off' || !slot.start) continue;
+
+      const [hour, minute] = slot.start.split(':').map(Number);
+      const triggerDate = new Date();
+      triggerDate.setHours(hour, minute, 0, 0);
+      
+      // Віднімаємо 15 хвилин
+      triggerDate.setMinutes(triggerDate.getMinutes() - 15);
+
+      // Плануємо лише для майбутніх відключень сьогоднішнього дня
+      if (triggerDate > now) {
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: '⚡ Скоро відключення світла (Черга 3.1)',
+            body: `За графіком вимкнення о ${slot.start} (${slot.time}). Зарядіть пристрої!`,
+            sound: true,
+          },
+          trigger: {
+            type: Notifications.SchedulableTriggerInputTypes.DATE,
+            date: triggerDate,
+            channelId: 'outages',
+          },
+        });
+      }
+    }
+  };
 
   const loadCachedSchedule = async () => {
     try {
       const saved = await AsyncStorage.getItem(STORAGE_KEY);
       if (saved) setSchedule(JSON.parse(saved));
     } catch (e) {
-      console.log('Помилка читання кешу', e);
+      console.log(e);
     }
   };
 
   const fetchSchedule = async () => {
     setRefreshing(true);
     try {
-      const response = await fetch(API_URL);
-      if (!response.ok) throw new Error('Network error');
+      // Додаємо timestamp, щоб GitHub Raw не віддавав закешовану стару версію
+      const response = await fetch(`${API_URL}?t=${Date.now()}`);
+      if (!response.ok) throw new Error('Fetch failed');
       const data = await response.json();
-      
+
       setSchedule(data);
       setIsOffline(false);
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      await scheduleOutageAlerts(data.hours);
     } catch (error) {
-      // Якщо світло вимкнули і інтернет зник — залишаємо дані з кешу
       setIsOffline(true);
     } finally {
       setRefreshing(false);
@@ -79,17 +121,16 @@ export default function App() {
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="#121212" />
-      
       <View style={styles.header}>
         <Text style={styles.title}>Полтава • Черга {schedule.queue}</Text>
         <Text style={styles.subtitle}>
-          Оновлено: {schedule.updatedAt} {isOffline ? '(Офлайн-режим)' : ''}
+          Оновлено: {schedule.updatedAt} {isOffline ? '• Офлайн (з кешу)' : '• Пуші активні'}
         </Text>
       </View>
 
       <FlatList
         data={schedule.hours}
-        keyExtractor={(item) => item.time}
+        keyExtractor={(item, idx) => `${item.time}-${idx}`}
         renderItem={renderSlot}
         contentContainerStyle={styles.list}
         refreshControl={
